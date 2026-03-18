@@ -51,3 +51,49 @@ LMSR_DECISION_WINDOW_SECONDS: int = 60
 # Volatility Filter
 ATR_PERIOD: int = 14
 ATR_SPIKE_MULTIPLIER: float = 3.0
+
+# --- Composite Weights ---
+MOMENTUM_WEIGHT: float = 0.40
+STRUCTURE_WEIGHT: float = 0.35
+CONFLUENCE_WEIGHT: float = 0.25
+
+# --- Momentum Sub-Weights ---
+LMSR_VELOCITY_SUB_WEIGHT: float = 0.40
+BOS_TYPE_SUB_WEIGHT: float = 0.25
+ORDER_FLOW_SUB_WEIGHT: float = 0.20
+MULTI_TF_SUB_WEIGHT: float = 0.15
+
+# --- Structure Sub-Weights ---
+CONTROL_STATE_SUB_WEIGHT: float = 0.25
+ZONE_POSITION_SUB_WEIGHT: float = 0.20
+SWING_STRENGTH_SUB_WEIGHT: float = 0.15
+RETURN_TYPE_SUB_WEIGHT: float = 0.20
+ZONE_QUALITY_SUB_WEIGHT: float = 0.20
+
+# --- Confluence Sub-Weights ---
+SWEEP_SIGNAL_SUB_WEIGHT: float = 0.30
+SD_FLIP_SUB_WEIGHT: float = 0.20
+QM_PATTERN_SUB_WEIGHT: float = 0.15
+FVG_FILL_SUB_WEIGHT: float = 0.15
+ENGULFING_SUB_WEIGHT: float = 0.20
+
+# --- Scoring Thresholds ---
+MIN_TOTAL_SCORE_TO_BET: float = 0.45
+HIGH_CONFIDENCE_SCORE: float = 0.65
+ORDER_FLOW_HEALTHY_MIN: int = 2
+ORDER_FLOW_STRONG_MIN: int = 4
+
+# --- Decision Engine ---
+BET_SIZE_BASE_PCT: float = 0.05
+BET_SIZE_HIGH_CONF_PCT: float = 0.10
+BET_SIZE_MAX_PCT: float = 0.15
+
+# --- Meta-rule Vetoes ---
+VETO_CONTROL_OPPOSING: bool = True
+VETO_CORRECTIVE_RETURN: bool = True
+VETO_NO_BOS_CONFIRMATION: bool = True
+VETO_RANGING_BOTH_TF: bool = True
+
+# --- Confidence Mapping ---
+CONFIDENCE_FROM_SCORE_FLOOR: float = 0.45
+CONFIDENCE_FROM_SCORE_CEILING: float = 0.80

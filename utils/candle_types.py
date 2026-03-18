@@ -36,6 +36,7 @@ class SwingStrength(Enum):
     """Whether the move from this swing broke the opposing zone."""
 
     STRONG = "strong"
+    MODERATE = "moderate"
     WEAK = "weak"
     UNCLASSIFIED = "unclassified"
 
@@ -299,3 +300,40 @@ class BetDecision:
     def is_skip(self) -> bool:
         """True when no direction is set (skip this window)."""
         return self.direction is None
+
+
+@dataclass
+class ScoreBreakdown:
+    """Detailed breakdown of SMC scoring."""
+
+    direction: Direction
+
+    # Momentum composite
+    momentum_score: float = 0.0
+    lmsr_velocity_score: float = 0.0
+    bos_type_score: float = 0.0
+    order_flow_score: float = 0.0
+    multi_tf_score: float = 0.0
+
+    # Structure composite
+    structure_score: float = 0.0
+    control_state_score: float = 0.0
+    zone_position_score: float = 0.0
+    swing_strength_score: float = 0.0
+    return_type_score: float = 0.0
+    zone_quality_score: float = 0.0
+
+    # Confluence composite
+    confluence_score: float = 0.0
+    sweep_score: float = 0.0
+    sd_flip_score: float = 0.0
+    qm_score: float = 0.0
+    fvg_score: float = 0.0
+    engulfing_score: float = 0.0
+
+    # Weighted total
+    total_score: float = 0.0
+
+    # Meta
+    reasons: list[str] = field(default_factory=list)
+    timestamp: float = 0.0
