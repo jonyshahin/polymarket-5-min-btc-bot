@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+trades.csv
+*.egg-info/
+dist/
+build/
+.mypy_cache/
