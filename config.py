@@ -74,3 +74,11 @@ SELECTIVE_MIN_PRIOR_MOVE: float = float(os.getenv("SELECTIVE_MIN_PRIOR_MOVE", "0
 
 # --- Logging ---
 TRADE_LOG_FILE: str = "trades.csv"
+
+# --- SMC Strategy Timing ---
+SMC_DECISION_START: int = int(os.getenv("SMC_DECISION_START", "180"))   # T+180s: start decision window
+SMC_DECISION_END: int = int(os.getenv("SMC_DECISION_END", "250"))      # T+250s: hard deadline
+SMC_CANDLE_INTERVAL: float = float(os.getenv("SMC_CANDLE_INTERVAL", "1.0"))  # Feed ticks every 1s
+SMC_DECISION_INTERVAL: float = float(os.getenv("SMC_DECISION_INTERVAL", "2.0"))  # Re-evaluate every 2s
+SMC_MIN_1M_CANDLES: int = int(os.getenv("SMC_MIN_1M_CANDLES", "3"))    # Need at least 3 candles for structure
+SMC_LMSR_WEIGHT_BOOST: float = float(os.getenv("SMC_LMSR_WEIGHT_BOOST", "1.0"))  # Multiplier for LMSR signal in SMC mode

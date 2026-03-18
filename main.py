@@ -524,6 +524,306 @@ async def _selective_loop(
     return None, None
 
 
+# ── SMC strategy loop ─────────────────────────────────────────────────────
+
+async def _smc_loop(
+    window: market.Window,
+    feed: BinanceFeed,
+    db: BotDatabase,
+) -> tuple:
+    """SMC strategy: full structural analysis + LMSR velocity confluence.
+
+    Returns (BetDecision, edge_result) or (None, None).
+
+    This function:
+    1. Creates fresh SMC engine instances for this window
+    2. Builds 1m candles from the feed's tick data
+    3. Feeds each candle through the full SMC pipeline
+    4. Collects LMSR snapshots in parallel
+    5. At decision time (T+180s–T+250s), runs DecisionEngine
+    6. Logs everything via SMCTradeLogger
+    7. Returns the best BetDecision for execution
+    """
+    try:
+        from engines.candle_aggregator import CandleAggregator
+        from engines.market_structure import MarketStructure
+        from engines.zone_engine import ZoneEngine
+        from engines.control_state import ControlState
+        from engines.liquidity_engine import LiquidityEngine
+        from engines.confluence_engine import ConfluenceEngine
+        from engines.decision_engine import DecisionEngine
+        from engines.smc_trade_logger import SMCTradeLogger
+        from utils.candle_types import Candle, Direction, ZoneType, ScoreBreakdown
+
+        # Create fresh engine instances for this window
+        aggregator = CandleAggregator()
+        ms_1m = MarketStructure()
+        ms_5m = MarketStructure()
+        zone_eng = ZoneEngine()
+        ctrl = ControlState()
+        liq_eng = LiquidityEngine()
+        conf_eng = ConfluenceEngine()
+        decision_eng = DecisionEngine()
+        smc_logger = SMCTradeLogger(db)
+
+        # Build 5m context from prior window ticks
+        prior_ticks = [t for t in feed.ticks
+                       if window.timestamp - 300 <= t.timestamp < window.timestamp]
+        if len(prior_ticks) >= 60:
+            prior_5m = Candle(
+                timestamp=window.timestamp - 300,
+                open=prior_ticks[0].close,
+                high=max(t.high for t in prior_ticks),
+                low=min(t.low for t in prior_ticks),
+                close=prior_ticks[-1].close,
+                volume=sum(t.volume for t in prior_ticks),
+            )
+            ms_5m.update(prior_5m)
+
+            range_high = max(t.high for t in prior_ticks)
+            range_low = min(t.low for t in prior_ticks)
+            liq_eng.update_range(range_high, range_low)
+            zone_eng.update_positions(range_high, range_low)
+
+        collect_start = window.timestamp + config.LMSR_COLLECT_START
+        decision_start = window.timestamp + config.SMC_DECISION_START
+        decision_end = window.timestamp + config.SMC_DECISION_END
+
+        candles_1m: list[Candle] = []
+        prev_snapshot = None
+        best_decision = None
+        best_edge_result = None
+        best_total_score = -1.0
+        last_tick_ts = 0.0
+
+        while time.time() < decision_end:
+            now = time.time()
+
+            # --- Feed ticks to aggregator ---
+            new_ticks = [t for t in feed.ticks
+                         if t.timestamp > last_tick_ts and t.timestamp >= window.timestamp]
+            for tick in new_ticks:
+                completed_candle = aggregator.feed_tick(tick.close, tick.timestamp)
+                if completed_candle is not None:
+                    candles_1m.append(completed_candle)
+
+                    # Feed through SMC pipeline
+                    bos = ms_1m.update(completed_candle)
+                    zone = zone_eng.update(completed_candle, bos, candles_1m)
+                    ctrl.update(completed_candle, zone_eng.get_active_zones())
+                    liq_eng.update(
+                        completed_candle,
+                        ms_1m.get_swing_highs(),
+                        ms_1m.get_swing_lows(),
+                    )
+                    conf_eng.update(
+                        completed_candle, candles_1m,
+                        ms_1m.get_swings(), zone_eng.get_active_zones(), bos,
+                    )
+
+                    smc_logger.log_candle(window.timestamp, "1m", completed_candle)
+
+                    # Build 5m candle every 5 completed 1m candles
+                    if len(candles_1m) % 5 == 0 and len(candles_1m) >= 5:
+                        last_5 = candles_1m[-5:]
+                        candle_5m = Candle(
+                            timestamp=last_5[0].timestamp,
+                            open=last_5[0].open,
+                            high=max(c.high for c in last_5),
+                            low=min(c.low for c in last_5),
+                            close=last_5[-1].close,
+                            volume=sum(c.volume for c in last_5),
+                        )
+                        ms_5m.update(candle_5m)
+                        smc_logger.log_candle(window.timestamp, "5m", candle_5m)
+
+            if new_ticks:
+                last_tick_ts = new_ticks[-1].timestamp
+
+            # --- Collect LMSR snapshots (parallel) ---
+            if now >= collect_start:
+                prev_snapshot = await _collect_market_snapshot(window, feed, db, prev_snapshot)
+
+            # --- Decision window ---
+            if now >= decision_start and len(candles_1m) >= config.SMC_MIN_1M_CANDLES:
+                # Gather LMSR velocity
+                snap_dicts = db.get_recent_snapshots(window.timestamp)
+                lmsr_velocity = 0.0
+                if len(snap_dicts) >= 2:
+                    lmsr_velocity, _ = strategy.compute_lmsr_velocity(snap_dicts)
+
+                # Normalize LMSR velocity to -1..+1 signal
+                if abs(lmsr_velocity) > 1e-9:
+                    lmsr_signal = lmsr_velocity / config.LMSR_VELOCITY_THRESHOLD
+                    lmsr_signal = max(-1.0, min(1.0, lmsr_signal))
+                    lmsr_signal *= config.SMC_LMSR_WEIGHT_BOOST
+                    lmsr_signal = max(-1.0, min(1.0, lmsr_signal))
+                else:
+                    lmsr_signal = 0.0
+
+                # Gather engine state
+                current_price = feed.last_price or candles_1m[-1].close
+
+                # Get confluence signals for both directions
+                recent_qm = conf_eng.get_recent_qm()
+                recent_flips = conf_eng.get_recent_flips()
+                engulfing_dir = conf_eng.check_strong_engulfing(candles_1m)
+                return_type = conf_eng.classify_return_type(candles_1m)
+
+                has_qm_bull = recent_qm is not None and recent_qm.direction == Direction.BULLISH
+                has_qm_bear = recent_qm is not None and recent_qm.direction == Direction.BEARISH
+                has_flip_bull = any(f.direction == Direction.BULLISH for f in recent_flips)
+                has_flip_bear = any(f.direction == Direction.BEARISH for f in recent_flips)
+                has_fvg_bull = conf_eng.has_recent_fvg_fill(Direction.BULLISH)
+                has_fvg_bear = conf_eng.has_recent_fvg_fill(Direction.BEARISH)
+
+                sweep = liq_eng.get_sweep_within(5, now)
+
+                # Run decision engine
+                decision = decision_eng.decide(
+                    lmsr_velocity_signal=lmsr_signal,
+                    latest_bos_1m=ms_1m.get_latest_bos(),
+                    trend_1m=ms_1m.get_trend(),
+                    order_flow_count_bullish=ms_1m.get_order_flow_count(Direction.BULLISH),
+                    order_flow_count_bearish=ms_1m.get_order_flow_count(Direction.BEARISH),
+                    latest_bos_5m=ms_5m.get_latest_bos(),
+                    trend_5m=ms_5m.get_trend(),
+                    control_state=ctrl.get_state(),
+                    nearest_demand=zone_eng.get_nearest_zone(current_price, ZoneType.DEMAND),
+                    nearest_supply=zone_eng.get_nearest_zone(current_price, ZoneType.SUPPLY),
+                    recent_sweep=sweep,
+                    return_type=return_type,
+                    has_fvg_fill_bullish=has_fvg_bull,
+                    has_fvg_fill_bearish=has_fvg_bear,
+                    has_sd_flip_bullish=has_flip_bull,
+                    has_sd_flip_bearish=has_flip_bear,
+                    has_qm_bullish=has_qm_bull,
+                    has_qm_bearish=has_qm_bear,
+                    engulfing_direction=engulfing_dir,
+                    timestamp=now,
+                )
+
+                # Get score breakdown for logging
+                if decision.direction is not None:
+                    scoring = decision_eng.get_scoring_engine()
+                    chosen_zone = (zone_eng.get_nearest_zone(current_price, ZoneType.DEMAND)
+                                   if decision.direction == Direction.BULLISH
+                                   else zone_eng.get_nearest_zone(current_price, ZoneType.SUPPLY))
+                    score_breakdown = scoring.score(
+                        decision.direction,
+                        lmsr_velocity_signal=lmsr_signal,
+                        latest_bos=ms_1m.get_latest_bos(),
+                        trend_1m=ms_1m.get_trend(),
+                        trend_5m=ms_5m.get_trend(),
+                        order_flow_count=ms_1m.get_order_flow_count(decision.direction),
+                        control_state=ctrl.get_state(),
+                        nearest_zone=chosen_zone,
+                        recent_sweep=sweep,
+                        return_type=return_type,
+                        has_fvg_fill=has_fvg_bull if decision.direction == Direction.BULLISH else has_fvg_bear,
+                        has_sd_flip=has_flip_bull if decision.direction == Direction.BULLISH else has_flip_bear,
+                        has_qm=has_qm_bull if decision.direction == Direction.BULLISH else has_qm_bear,
+                        engulfing_direction=engulfing_dir,
+                        timestamp=now,
+                    )
+                else:
+                    score_breakdown = ScoreBreakdown(direction=Direction.BULLISH, timestamp=now)
+
+                # Log to database
+                smc_logger.log_decision(
+                    window_ts=window.timestamp,
+                    decision=decision,
+                    score_breakdown=score_breakdown,
+                    market_structure_1m=ms_1m,
+                    market_structure_5m=ms_5m,
+                    control_machine=ctrl,
+                    zone_engine=zone_eng,
+                    liquidity_engine=liq_eng,
+                    confluence_engine=conf_eng,
+                    lmsr_velocity_raw=lmsr_velocity,
+                    current_price=current_price,
+                )
+
+                # Track best decision
+                if decision.should_bet:
+                    score_val = (decision.momentum_score * 0.4
+                                 + decision.structure_score * 0.35
+                                 + decision.confluence_score * 0.25)
+                    if score_val > best_total_score:
+                        best_total_score = score_val
+                        best_decision = decision
+
+                        side = "UP" if decision.direction == Direction.BULLISH else "DOWN"
+                        try:
+                            ev_loop = asyncio.get_running_loop()
+                            up_price, down_price = await ev_loop.run_in_executor(
+                                None, executor.get_market_prices,
+                                window.up_token_id, window.down_token_id,
+                            )
+
+                            model_prob = 0.5 + (decision.confidence * 0.3
+                                                if side == "UP"
+                                                else -decision.confidence * 0.3) + 0.005
+                            model_prob = max(0.01, min(0.99, model_prob))
+
+                            best_edge_result = edge_mod.compute_edge(
+                                model_prob_up=model_prob,
+                                market_price_up=up_price,
+                                market_price_down=down_price,
+                                up_token_id=window.up_token_id,
+                                down_token_id=window.down_token_id,
+                            )
+
+                            elapsed = time.time() - window.timestamp
+                            log.info(
+                                "  [SMC T+%.0fs] dir=%s conf=%.2f score=%.3f "
+                                "(M=%.2f S=%.2f C=%.2f) | edge=%s %.1f%%",
+                                elapsed, side, decision.confidence, score_val,
+                                decision.momentum_score, decision.structure_score,
+                                decision.confluence_score,
+                                best_edge_result.side, best_edge_result.edge_pct,
+                            )
+                            for reason in decision.reasons[:5]:
+                                log.info("    → %s", reason)
+
+                        except Exception as exc:
+                            log.warning("  SMC: could not fetch market prices: %s", exc)
+                            best_decision = None
+                            best_edge_result = None
+                else:
+                    elapsed = time.time() - window.timestamp
+                    if decision.reasons:
+                        log.info("  [SMC T+%.0fs] SKIP: %s", elapsed, "; ".join(decision.reasons[:3]))
+
+            await asyncio.sleep(config.SMC_DECISION_INTERVAL)
+
+        # Flush candle writes
+        smc_logger.flush()
+
+        return best_decision, best_edge_result
+
+    except Exception as exc:
+        log.error("SMC engine error: %s", exc, exc_info=True)
+        return None, None
+
+
+def _print_smc_signal(decision):
+    """Print SMC decision details."""
+    from utils.candle_types import Direction
+    print(f"  ── SMC Decision ──")
+    side = decision.direction.value if decision.direction else "SKIP"
+    print(f"    Direction: {side}")
+    print(f"    Confidence: {decision.confidence:.2f}")
+    print(f"    Bet Size: {decision.bet_size_pct:.1%}")
+    print(f"    Momentum:   {decision.momentum_score:.3f}")
+    print(f"    Structure:  {decision.structure_score:.3f}")
+    print(f"    Confluence: {decision.confluence_score:.3f}")
+    if decision.reasons:
+        print(f"    Reasons:")
+        for r in decision.reasons[:8]:
+            print(f"      → {r}")
+
+
 # ── Window handler ────────────────────────────────────────────────────────
 
 async def run_window(
@@ -553,7 +853,7 @@ async def run_window(
     db.record_window(window.timestamp, window.slug, btc_open)
 
     # Print trend context at window start
-    if strategy_mode in ("early", "lmsr", "selective"):
+    if strategy_mode in ("early", "lmsr", "selective", "smc"):
         prior_delta = feed.get_prior_window_delta()
         trend = strategy.compute_trend_context(feed.prices(), prior_delta)
         if trend:
@@ -562,6 +862,46 @@ async def run_window(
                      trend.prior_window_delta, trend.vol_regime)
 
     # Route to correct strategy loop
+
+    # SMC strategy
+    if strategy_mode == "smc":
+        from utils.candle_types import Direction as _Dir
+        smc_decision, best_edge_result = await _smc_loop(window, feed, db)
+
+        if smc_decision is None or best_edge_result is None:
+            log.info("  No SMC signal produced — skipping window")
+            return
+
+        _print_smc_signal(smc_decision)
+
+        er = best_edge_result
+        if not er.is_tradeable:
+            print(f"  NO TRADE — edge {er.edge_pct:.1f}% < threshold {config.EDGE_THRESHOLD * 100:.0f}%")
+            side = "UP" if smc_decision.direction == _Dir.BULLISH else "DOWN"
+            db.record_trade(
+                window_ts=window.timestamp, strategy="smc", side=side,
+                buy_price=er.buy_price, shares=0, amount=0,
+                signal_score=smc_decision.confidence,
+                signal_confidence=smc_decision.confidence,
+                model_prob=0.0, edge_pct=er.edge_pct,
+                up_price_at_entry=er.market_price_up,
+                down_price_at_entry=er.market_price_down,
+                order_type="SKIP", dry_run=dry_run, outcome="SKIPPED",
+            )
+            _print_session_summary(db)
+            return
+
+        side = "UP" if smc_decision.direction == _Dir.BULLISH else "DOWN"
+        return await _execute_trade(
+            window, feed, risk_mgr, er, dry_run, db,
+            strategy_name="smc",
+            signal_score=smc_decision.confidence,
+            signal_confidence=smc_decision.confidence,
+            model_prob=er.buy_price,
+            up_price_at_entry=er.market_price_up,
+            down_price_at_entry=er.market_price_down,
+        )
+
     if strategy_mode == "lmsr":
         lmsr_sig, best_edge_result = await _lmsr_loop(window, feed, db)
 
@@ -817,6 +1157,11 @@ async def main_loop(dry_run: bool, once: bool, strategy_mode: str, max_windows: 
         print(f"  Velocity threshold: {config.LMSR_VELOCITY_THRESHOLD} $/sec")
         print(f"  Min prior move: {config.SELECTIVE_MIN_PRIOR_MOVE:.4%}")
         print(f"  Max price: ${config.LMSR_MAX_PRICE:.2f}")
+    elif strategy_mode == "smc":
+        print(f"  SMC structural analysis + LMSR confluence")
+        print(f"  Decision window: T+{config.SMC_DECISION_START}s to T+{config.SMC_DECISION_END}s")
+        print(f"  Min 1m candles: {config.SMC_MIN_1M_CANDLES}")
+        print(f"  LMSR velocity threshold: {config.LMSR_VELOCITY_THRESHOLD} $/sec")
     else:
         print(f"  Entry window: T-{config.LEAD_TIME}s to T-{config.HARD_DEADLINE}s")
     if max_windows > 0:
@@ -845,7 +1190,7 @@ async def main_loop(dry_run: bool, once: bool, strategy_mode: str, max_windows: 
                  format_price(feed.last_price), len(feed.ticks))
 
         # Warmup
-        if strategy_mode not in ("lmsr", "selective") and len(feed.ticks) < WARMUP_TICKS:
+        if strategy_mode not in ("lmsr", "selective", "smc") and len(feed.ticks) < WARMUP_TICKS:
             log.info("Warming up — need %d ticks for trend context, have %d. Waiting ~%ds...",
                      WARMUP_TICKS, len(feed.ticks), WARMUP_TICKS - len(feed.ticks))
             while len(feed.ticks) < WARMUP_TICKS and feed._running:
@@ -868,8 +1213,11 @@ async def main_loop(dry_run: bool, once: bool, strategy_mode: str, max_windows: 
                         win_ts = market.next_window_ts()
                         win = market.make_window(win_ts)
                     sleep_until = max(win.timestamp - 5, now_ts + 0.5)
-                elif strategy_mode in ("lmsr", "selective"):
-                    entry_deadline = win.timestamp + config.LMSR_ENTRY_END
+                elif strategy_mode in ("lmsr", "selective", "smc"):
+                    if strategy_mode == "smc":
+                        entry_deadline = win.timestamp + config.SMC_DECISION_END
+                    else:
+                        entry_deadline = win.timestamp + config.LMSR_ENTRY_END
                     if now_ts > entry_deadline or win.timestamp == last_processed_ts:
                         win_ts = market.next_window_ts()
                         win = market.make_window(win_ts)
@@ -951,8 +1299,8 @@ def main():
     parser = argparse.ArgumentParser(description="Polymarket BTC Up/Down 5-min trading bot")
     parser.add_argument("--dry-run", action="store_true", help="Run without placing real orders")
     parser.add_argument("--once", action="store_true", help="Process one window then exit")
-    parser.add_argument("--strategy", choices=["early", "late", "lmsr", "selective"], default="early",
-                        help="Strategy: 'early', 'late', 'lmsr' (price velocity), or 'selective' (reversal+LMSR)")
+    parser.add_argument("--strategy", choices=["early", "late", "lmsr", "selective", "smc"], default="early",
+                        help="Strategy: 'early', 'late', 'lmsr' (price velocity), 'selective' (reversal+LMSR), or 'smc' (structural analysis)")
     parser.add_argument("--max-windows", type=int, default=0,
                         help="Stop after N windows (0 = unlimited)")
     args = parser.parse_args()
