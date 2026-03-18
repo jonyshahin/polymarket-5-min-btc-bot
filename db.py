@@ -117,6 +117,112 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_window ON market_snapshots(window_ts);
 CREATE INDEX IF NOT EXISTS idx_trades_window ON trades(window_ts);
 CREATE INDEX IF NOT EXISTS idx_trades_outcome ON trades(outcome);
 CREATE INDEX IF NOT EXISTS idx_windows_resolved ON windows(resolved_at);
+
+-- SMC tables (Step 7)
+
+CREATE TABLE IF NOT EXISTS smc_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_ts INTEGER NOT NULL,
+    decision_time TEXT NOT NULL,
+    candle_timestamp REAL,
+
+    -- Decision result
+    direction TEXT,
+    confidence REAL,
+    bet_size_pct REAL,
+    is_skip INTEGER DEFAULT 0,
+
+    -- Composite scores
+    momentum_score REAL,
+    structure_score REAL,
+    confluence_score REAL,
+    total_score REAL,
+
+    -- Momentum sub-scores
+    lmsr_velocity_score REAL,
+    bos_type_score REAL,
+    order_flow_score REAL,
+    multi_tf_score REAL,
+
+    -- Structure sub-scores
+    control_state_score REAL,
+    zone_position_score REAL,
+    swing_strength_score REAL,
+    return_type_score REAL,
+    zone_quality_score REAL,
+
+    -- Confluence sub-scores
+    sweep_score REAL,
+    sd_flip_score REAL,
+    qm_score REAL,
+    fvg_score REAL,
+    engulfing_score REAL,
+
+    -- Context
+    trend_1m TEXT,
+    trend_5m TEXT,
+    control_state TEXT,
+    return_type TEXT,
+    nearest_zone_type TEXT,
+    nearest_zone_position TEXT,
+    nearest_zone_quality INTEGER,
+    lmsr_velocity_raw REAL,
+    order_flow_count_bull INTEGER,
+    order_flow_count_bear INTEGER,
+    has_sweep INTEGER DEFAULT 0,
+    has_fvg_fill INTEGER DEFAULT 0,
+    has_sd_flip INTEGER DEFAULT 0,
+    has_qm INTEGER DEFAULT 0,
+    has_engulfing INTEGER DEFAULT 0,
+
+    -- Reasons (JSON list)
+    reasons_json TEXT,
+
+    -- Veto info
+    was_vetoed INTEGER DEFAULT 0,
+    veto_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS smc_candles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_ts INTEGER NOT NULL,
+    timeframe TEXT NOT NULL,
+    candle_timestamp REAL NOT NULL,
+    open REAL, high REAL, low REAL, close REAL, volume REAL
+);
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_time TEXT NOT NULL,
+    description TEXT,
+    config_json TEXT,
+
+    -- Data range
+    candle_count INTEGER,
+    start_timestamp REAL,
+    end_timestamp REAL,
+
+    -- Results
+    total_decisions INTEGER DEFAULT 0,
+    total_bets INTEGER DEFAULT 0,
+    total_skips INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0,
+    win_rate REAL,
+    total_pnl REAL DEFAULT 0.0,
+    avg_confidence REAL,
+    avg_bet_size REAL,
+
+    -- Veto stats
+    vetoed_by_control INTEGER DEFAULT 0,
+    vetoed_by_return_type INTEGER DEFAULT 0,
+    vetoed_by_no_bos INTEGER DEFAULT 0,
+    vetoed_by_ranging INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_smc_decisions_window ON smc_decisions(window_ts);
+CREATE INDEX IF NOT EXISTS idx_smc_candles_window ON smc_candles(window_ts, timeframe);
+CREATE INDEX IF NOT EXISTS idx_smc_decisions_direction ON smc_decisions(direction);
 """
 
 
@@ -585,3 +691,176 @@ class BotDatabase:
                 writer.writerow(list(r))
 
         log.info("Exported %d trades to %s", len(rows), path)
+
+    # ── SMC Tables (Step 7) ──────────────────────────────────────────────
+
+    def record_smc_decision(
+        self,
+        window_ts: int,
+        decision: 'object',
+        score: 'object',
+        *,
+        trend_1m: Optional[str] = None,
+        trend_5m: Optional[str] = None,
+        control_state: Optional[str] = None,
+        return_type: Optional[str] = None,
+        nearest_zone_type: Optional[str] = None,
+        nearest_zone_position: Optional[str] = None,
+        nearest_zone_quality: Optional[int] = None,
+        lmsr_velocity_raw: float = 0.0,
+        order_flow_count_bull: int = 0,
+        order_flow_count_bear: int = 0,
+        has_sweep: bool = False,
+        has_fvg_fill: bool = False,
+        has_sd_flip: bool = False,
+        has_qm: bool = False,
+        has_engulfing: bool = False,
+        was_vetoed: bool = False,
+        veto_reason: str = "",
+        candle_timestamp: float = 0.0,
+    ) -> int:
+        """Record a full SMC decision with all sub-scores and context.
+        Returns the inserted row ID.
+        """
+        import json
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        reasons_json = json.dumps(decision.reasons)
+
+        cur = self.conn.execute(
+            """INSERT INTO smc_decisions (
+                window_ts, decision_time, candle_timestamp,
+                direction, confidence, bet_size_pct, is_skip,
+                momentum_score, structure_score, confluence_score, total_score,
+                lmsr_velocity_score, bos_type_score, order_flow_score, multi_tf_score,
+                control_state_score, zone_position_score, swing_strength_score,
+                return_type_score, zone_quality_score,
+                sweep_score, sd_flip_score, qm_score, fvg_score, engulfing_score,
+                trend_1m, trend_5m, control_state, return_type,
+                nearest_zone_type, nearest_zone_position, nearest_zone_quality,
+                lmsr_velocity_raw, order_flow_count_bull, order_flow_count_bear,
+                has_sweep, has_fvg_fill, has_sd_flip, has_qm, has_engulfing,
+                reasons_json, was_vetoed, veto_reason
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?
+            )""",
+            (
+                window_ts, now, candle_timestamp,
+                decision.direction.value if decision.direction else None,
+                decision.confidence, decision.bet_size_pct, int(decision.is_skip),
+                score.momentum_score, score.structure_score, score.confluence_score,
+                score.total_score,
+                score.lmsr_velocity_score, score.bos_type_score, score.order_flow_score,
+                score.multi_tf_score,
+                score.control_state_score, score.zone_position_score,
+                score.swing_strength_score, score.return_type_score, score.zone_quality_score,
+                score.sweep_score, score.sd_flip_score, score.qm_score, score.fvg_score,
+                score.engulfing_score,
+                trend_1m, trend_5m, control_state, return_type,
+                nearest_zone_type, nearest_zone_position, nearest_zone_quality,
+                lmsr_velocity_raw, order_flow_count_bull, order_flow_count_bear,
+                int(has_sweep), int(has_fvg_fill), int(has_sd_flip), int(has_qm),
+                int(has_engulfing),
+                reasons_json, int(was_vetoed), veto_reason,
+            ),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def record_smc_candle(
+        self, window_ts: int, timeframe: str, candle: 'object',
+    ) -> None:
+        """Record a candle to the smc_candles table for historical replay."""
+        self.conn.execute(
+            """INSERT INTO smc_candles (window_ts, timeframe, candle_timestamp,
+               open, high, low, close, volume)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (window_ts, timeframe, candle.timestamp,
+             candle.open, candle.high, candle.low, candle.close, candle.volume),
+        )
+        # Don't commit per candle — caller should batch commits.
+
+    def record_backtest_run(self, run: dict) -> int:
+        """Record a backtest run summary. Returns run ID."""
+        import json
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        cur = self.conn.execute(
+            """INSERT INTO backtest_runs (
+                run_time, description, config_json,
+                candle_count, start_timestamp, end_timestamp,
+                total_decisions, total_bets, total_skips,
+                wins, losses, win_rate, total_pnl,
+                avg_confidence, avg_bet_size,
+                vetoed_by_control, vetoed_by_return_type,
+                vetoed_by_no_bos, vetoed_by_ranging
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                now, run.get("description", ""),
+                json.dumps(run.get("config", {})),
+                run.get("candle_count", 0),
+                run.get("start_timestamp", 0),
+                run.get("end_timestamp", 0),
+                run.get("total_decisions", 0),
+                run.get("total_bets", 0),
+                run.get("total_skips", 0),
+                run.get("wins", 0),
+                run.get("losses", 0),
+                run.get("win_rate", 0.0),
+                run.get("total_pnl", 0.0),
+                run.get("avg_confidence", 0.0),
+                run.get("avg_bet_size", 0.0),
+                run.get("vetoed_by_control", 0),
+                run.get("vetoed_by_return_type", 0),
+                run.get("vetoed_by_no_bos", 0),
+                run.get("vetoed_by_ranging", 0),
+            ),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_smc_decisions(self, window_ts: Optional[int] = None, limit: int = 100) -> list[dict]:
+        """Query SMC decisions. Optionally filter by window_ts."""
+        if window_ts is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM smc_decisions WHERE window_ts=? ORDER BY id DESC LIMIT ?",
+                (window_ts, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM smc_decisions ORDER BY id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_smc_candles(self, window_ts: int, timeframe: str = "1m") -> list[dict]:
+        """Get stored candles for a window and timeframe."""
+        rows = self.conn.execute(
+            """SELECT * FROM smc_candles WHERE window_ts=? AND timeframe=?
+               ORDER BY candle_timestamp ASC""",
+            (window_ts, timeframe),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_backtest_runs(self, limit: int = 20) -> list[dict]:
+        """Get recent backtest runs."""
+        rows = self.conn.execute(
+            "SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?", (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_smc_decision_stats(self) -> dict:
+        """Aggregate stats across all SMC decisions."""
+        row = self.conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN is_skip = 0 THEN 1 ELSE 0 END) as bets,
+                SUM(is_skip) as skips,
+                AVG(CASE WHEN is_skip = 0 THEN confidence END) as avg_confidence,
+                AVG(CASE WHEN is_skip = 0 THEN total_score END) as avg_score,
+                AVG(CASE WHEN is_skip = 0 THEN momentum_score END) as avg_momentum,
+                AVG(CASE WHEN is_skip = 0 THEN structure_score END) as avg_structure,
+                AVG(CASE WHEN is_skip = 0 THEN confluence_score END) as avg_confluence,
+                SUM(was_vetoed) as total_vetoed
+            FROM smc_decisions
+        """).fetchone()
+        return dict(row) if row else {}
