@@ -8,3 +8,4 @@ trades.csv
 dist/
 build/
 .mypy_cache/
+logs/

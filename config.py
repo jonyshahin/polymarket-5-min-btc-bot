@@ -82,3 +82,9 @@ SMC_CANDLE_INTERVAL: float = float(os.getenv("SMC_CANDLE_INTERVAL", "1.0"))  # F
 SMC_DECISION_INTERVAL: float = float(os.getenv("SMC_DECISION_INTERVAL", "2.0"))  # Re-evaluate every 2s
 SMC_MIN_1M_CANDLES: int = int(os.getenv("SMC_MIN_1M_CANDLES", "3"))    # Need at least 3 candles for structure
 SMC_LMSR_WEIGHT_BOOST: float = float(os.getenv("SMC_LMSR_WEIGHT_BOOST", "1.0"))  # Multiplier for LMSR signal in SMC mode
+
+# --- Telegram ---
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_REPORT_INTERVAL: int = int(os.getenv("TELEGRAM_REPORT_INTERVAL", "3600"))  # seconds (3600 = 1 hour)
+TELEGRAM_TRADE_ALERTS: bool = os.getenv("TELEGRAM_TRADE_ALERTS", "false").lower() == "true"  # Per-trade alerts (noisy, off by default)

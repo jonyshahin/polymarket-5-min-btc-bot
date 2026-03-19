@@ -19,6 +19,7 @@ import risk as risk_mod
 import strategy
 from data_feed import BinanceFeed
 from db import BotDatabase
+from telegram_notifier import TelegramNotifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +27,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("bot")
+
+_telegram: TelegramNotifier | None = None
 
 
 def utc_now_str() -> str:
@@ -139,6 +142,11 @@ async def _resolve_and_update(feed: BinanceFeed, risk_mgr: risk_mod.RiskManager,
         winner = "Up" if r.btc_close >= r.btc_open else "Down"
         print(f"    {r.slug}: BTC {'+' if delta >= 0 else ''}{delta:.2f} → {winner} wins"
               f" | You: {r.side} → {r.outcome} (${r.pnl:+.2f})")
+
+    # Track resolutions for Telegram reports
+    if _telegram:
+        for r in resolved:
+            _telegram.record_trade(r.outcome, r.pnl)
 
     # Export CSV after resolution
     db.export_trades_csv()
@@ -804,6 +812,8 @@ async def _smc_loop(
 
     except Exception as exc:
         log.error("SMC engine error: %s", exc, exc_info=True)
+        if _telegram:
+            await _telegram.send_error_alert(str(exc))
         return None, None
 
 
@@ -1120,6 +1130,14 @@ async def _execute_trade(
         outcome="PENDING",
     )
 
+    # Send Telegram trade alert (live mode only, if enabled)
+    if not dry_run and config.TELEGRAM_TRADE_ALERTS and _telegram:
+        await _telegram.send_trade_alert(
+            side=er.side, confidence=signal_confidence,
+            edge_pct=er.edge_pct, amount=amount,
+            momentum=0.0, structure=0.0, confluence=0.0,
+        )
+
     _print_session_summary(db)
 
 
@@ -1129,9 +1147,16 @@ WARMUP_TICKS = 60
 
 
 async def main_loop(dry_run: bool, once: bool, strategy_mode: str, max_windows: int) -> None:
+    global _telegram
+
     db = BotDatabase()
     trade_logger.set_db(db)
     db.start_session(strategy_mode, dry_run)
+
+    telegram = TelegramNotifier()
+    await telegram.start()
+    _telegram = telegram
+    await telegram.send_startup_message(strategy_mode, dry_run)
 
     mode_label = "DRY RUN" if dry_run else "LIVE"
     print(f"\n{'=' * 60}")
@@ -1202,6 +1227,7 @@ async def main_loop(dry_run: bool, once: bool, strategy_mode: str, max_windows: 
             last_processed_ts = 0  # prevent re-entering same window
             while True:
                 await _resolve_and_update(feed, risk_mgr, db)
+                await telegram.check_and_send_report(db)
 
                 now_ts = time.time()
                 win_ts = market.current_window_ts()
@@ -1241,6 +1267,7 @@ async def main_loop(dry_run: bool, once: bool, strategy_mode: str, max_windows: 
 
                 risk_mgr.reset_window()
                 await run_window(win, feed, risk_mgr, session, dry_run, strategy_mode, db)
+                telegram.record_window()
                 last_processed_ts = win.timestamp
                 windows_processed += 1
 
@@ -1266,7 +1293,10 @@ async def main_loop(dry_run: bool, once: bool, strategy_mode: str, max_windows: 
         except KeyboardInterrupt:
             log.info("Shutting down — resolving pending trades...")
             await _resolve_and_update(feed, risk_mgr, db)
+            await telegram.send_shutdown_message(db, reason="keyboard interrupt")
         finally:
+            await telegram.send_shutdown_message(db, reason="normal")
+            await telegram.stop()
             await feed.stop()
 
     # Final output
