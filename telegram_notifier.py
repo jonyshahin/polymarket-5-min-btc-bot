@@ -84,7 +84,7 @@ class TelegramNotifier:
                     log.warning("Telegram API error %d: %s", resp.status, body[:200])
                     return False
         except Exception as exc:
-            log.warning("Telegram send failed: %s", exc)
+            log.warning("Telegram send failed: %s: %s", type(exc).__name__, exc)
             return False
 
     # ── Event tracking ───────────────────────────────────────────────

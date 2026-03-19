@@ -1222,6 +1222,7 @@ async def main_loop(dry_run: bool, once: bool, strategy_mode: str, max_windows: 
                 await asyncio.sleep(1)
             log.info("Warmup complete — %d ticks buffered", len(feed.ticks))
 
+        _shutdown_sent = False
         try:
             windows_processed = 0
             last_processed_ts = 0  # prevent re-entering same window
@@ -1294,8 +1295,10 @@ async def main_loop(dry_run: bool, once: bool, strategy_mode: str, max_windows: 
             log.info("Shutting down — resolving pending trades...")
             await _resolve_and_update(feed, risk_mgr, db)
             await telegram.send_shutdown_message(db, reason="keyboard interrupt")
+            _shutdown_sent = True
         finally:
-            await telegram.send_shutdown_message(db, reason="normal")
+            if not _shutdown_sent:
+                await telegram.send_shutdown_message(db, reason="normal")
             await telegram.stop()
             await feed.stop()
 
